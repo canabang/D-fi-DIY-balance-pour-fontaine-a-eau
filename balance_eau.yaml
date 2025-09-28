@@ -1,0 +1,253 @@
+# Include pour surveillance de fontaine à eau avec HX711
+# Configuration simplifiée pour post forum
+# Substitutions attendues :
+#  name: nom de l'appareil
+
+# ========================= VARIABLES GLOBALES POUR BALANCE EAU =========================
+globals:
+  # Valeurs de calibration pour la balance d'eau
+  - id: water_tare_offset  # Valeur brute à vide
+    type: float
+    restore_value: true
+    initial_value: "186585.0"  # Valeur brute actuelle pour 0 kg
+  
+  - id: water_full_scale_raw  # Valeur brute à plein
+    type: float
+    restore_value: true
+    initial_value: "229548.0"  # Valeur brute actuelle pour 1.715 kg
+    
+  - id: water_full_scale_weight  # Poids de référence pour le plein
+    type: float
+    restore_value: true
+    initial_value: "1.715"  # Poids correspondant à full_scale_raw
+  
+  - id: water_scale_factor  # Facteur calculé automatiquement
+    type: float
+    restore_value: true 
+    initial_value: "25.051"  # Sera recalculé lors de la calibration
+
+# ========================= CAPTEURS =========================
+sensor:
+  # Capteur HX711 principal pour l'eau
+  - platform: hx711
+    name: "Eau Raw Value"
+    id: water_scale_raw
+    dout_pin: 16  # Pin DOUT
+    clk_pin: 4    # Pin CLK
+    gain: 128
+    update_interval: 30s
+    unit_of_measurement: "raw"
+    accuracy_decimals: 0
+    icon: mdi:scale
+    internal: false
+    
+  # Capteur de poids calculé pour l'eau
+  - platform: template
+    name: "Eau Poids Gamelle"
+    id: water_scale_value
+    unit_of_measurement: "kg"
+    accuracy_decimals: 3
+    icon: mdi:scale-balance
+    update_interval: 30s
+    lambda: |-
+      // Calcul du facteur d'échelle dynamique basé sur les points de calibration
+      float current_scale_factor = (id(water_full_scale_raw) - id(water_tare_offset)) / id(water_full_scale_weight);
+      
+      // Vérifier si le facteur d'échelle est valide
+      if (current_scale_factor <= 0) {
+        ESP_LOGW("water_scale", "Facteur d'échelle invalide: %f", current_scale_factor);
+        return {}; // Retourne NaN pour éviter les calculs erronés
+      }
+      
+      // Utiliser ce facteur pour convertir la valeur brute en poids
+      float raw_value = id(water_scale_raw).state;
+      float raw_weight = (raw_value - id(water_tare_offset)) / current_scale_factor;
+      
+      // Journalisation des valeurs pour le débogage
+      ESP_LOGD("water_scale", "Valeur brute: %f, Tare: %f, Facteur: %f, Poids: %f", 
+               raw_value, id(water_tare_offset), current_scale_factor, raw_weight);
+      
+      // Premier niveau de sécurité - gamme de valeurs acceptables
+      if (raw_weight < -0.1 || raw_weight > id(water_full_scale_weight) * 1.2) {
+        ESP_LOGW("water_scale", "Valeur hors limites détectée: %f, ignorée", raw_weight);
+        return {};  // Retourne NaN pour ignorer cette mesure
+      }
+      
+      // Mise à jour du facteur d'échelle global pour les autres capteurs
+      id(water_scale_factor) = current_scale_factor;
+      
+      return raw_weight;
+    filters:
+      # Filtre de médiane pour éliminer les valeurs aberrantes
+      - median:
+          window_size: 7
+          send_first_at: 4
+          send_every: 5
+      # Suppression des fluctuations minimes
+      - lambda: |-
+          if (x < 0.010) {
+            return 0.000; // Ignorer les variations inférieures à 10g
+          } else {
+            return x;
+          }
+      # Moyennage supplémentaire pour stabiliser davantage
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 5
+      # Filtrage final pour garantir des valeurs dans la plage acceptable
+      - lambda: |-
+          if (x > 2.000) return 0.000; // Si > 2kg, probablement une erreur, retourner 0
+          if (x < 0.000) return 0.000; // Valeurs négatives ramenées à 0
+          return x;
+
+  # Pourcentage du niveau d'eau
+  - platform: template
+    name: "Eau %"
+    id: water_scale_percentage
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:water-percent
+    update_interval: 30s
+    lambda: |-
+      // Vérifier si la mesure de poids est valide
+      if (isnan(id(water_scale_value).state) || id(water_scale_value).state < 0) {
+        return {}; // Retourne NaN si la mesure n'est pas valide
+      }
+      
+      // Calcul du poids maximum basé sur le poids de référence
+      float max_weight = id(water_full_scale_weight);
+      
+      // Conversion en pourcentage avec saturation
+      if (id(water_scale_value).state <= 0.01) {
+        return 0.0; // En dessous de 10g, considéré comme vide
+      } else if (id(water_scale_value).state >= max_weight * 0.95) {
+        return 100.0; // Au dessus de 95% du poids max, considéré comme plein
+      } else {
+        return (id(water_scale_value).state / max_weight) * 100.0;
+      }
+    filters:
+      # Arrondi à l'entier le plus proche
+      - lambda: return round(x);
+      # Protection contre les valeurs aberrantes
+      - lambda: |-
+          if (x > 100.0) return 100.0;  // Limiter à 100% maximum
+          if (x < 0.0) return 0.0;      // Limiter à 0% minimum
+          return x;
+
+  # Valeur brute pour diagnostic
+  - platform: template
+    name: "Eau Valeur Brute"
+    unit_of_measurement: "raw"
+    accuracy_decimals: 0
+    update_interval: 120s
+    entity_category: "diagnostic"
+    icon: mdi:raw
+    lambda: |-
+      return id(water_scale_raw).state;
+
+  # État du capteur
+  - platform: template
+    name: "Eau Etat Capteur (code)"
+    id: "water_scale_status_code"
+    unit_of_measurement: ""
+    icon: mdi:information-outline
+    entity_category: "diagnostic"
+    update_interval: 120s
+    lambda: |-
+      float raw_value = id(water_scale_raw).state;
+      if (raw_value < 1000) {
+        return 0.0;  // Code d'erreur 0 - Erreur capteur
+      }
+      float offset_diff = abs(raw_value - id(water_tare_offset));
+      if (offset_diff > 100000) {
+        return 1.0;  // Code d'erreur 1 - Hors calibration
+      }
+      return 2.0;  // Code 2 - OK
+
+# ========================= CAPTEURS TEXTE =========================
+text_sensor:
+  # État de la balance en format texte
+  - platform: template
+    name: "Eau Etat Capteur"
+    entity_category: "diagnostic"
+    icon: mdi:information-outline
+    update_interval: 120s
+    lambda: |-
+      float raw_value = id(water_scale_raw).state;
+      if (raw_value < 1000) {
+        return {"Erreur capteur"};
+      }
+      float offset_diff = abs(raw_value - id(water_tare_offset));
+      if (offset_diff > 100000) {
+        return {"Hors calibration"};
+      }
+      return {"OK"};
+
+  # Instructions de calibration
+  - platform: template
+    name: "Eau Instructions calibration"
+    entity_category: "diagnostic"
+    icon: mdi:information-outline
+    lambda: |-
+      return {"Pour calibrer: 1) Videz la gamelle 2) Appuyez sur 'Tare Balance Eau (Vide)' "
+             "3) Remplissez avec un poids connu 4) Réglez le 'Poids de référence eau' "
+             "5) Appuyez sur 'Calibrer Balance Eau (Plein)'"};
+
+# ========================= BOUTONS =========================
+button:
+  # Boutons de calibration
+  - platform: template
+    name: "Eau Tare (Vide)"
+    icon: mdi:scale-balance
+    on_press:
+      - lambda: |-
+          id(water_tare_offset) = id(water_scale_raw).state;
+          id(water_scale_factor) = (id(water_full_scale_raw) - id(water_tare_offset)) / id(water_full_scale_weight);
+          ESP_LOGI("water_scale", "Nouvelle tare définie: %f, nouveau facteur: %f", 
+                  id(water_tare_offset), id(water_scale_factor));
+  
+  - platform: template
+    name: "Eau Tare (Plein)"
+    icon: mdi:weight
+    on_press:
+      - lambda: |-
+          id(water_full_scale_raw) = id(water_scale_raw).state;
+          id(water_scale_factor) = (id(water_full_scale_raw) - id(water_tare_offset)) / id(water_full_scale_weight);
+          ESP_LOGI("water_scale", "Nouvelle valeur plein: %f, nouveau facteur: %f", 
+                  id(water_full_scale_raw), id(water_scale_factor));
+
+# ========================= CONTRÔLES NUMÉRIQUES =========================
+number:
+  - platform: template
+    name: "Eau Poids de référence"
+    id: water_reference_weight_control
+    icon: mdi:weight
+    optimistic: true
+    min_value: 0.5
+    max_value: 3.0
+    step: 0.005
+    initial_value: 1.715
+    restore_value: false
+    unit_of_measurement: "kg"
+    on_value:
+      - lambda: |-
+          id(water_full_scale_weight) = x;
+          id(water_scale_factor) = (id(water_full_scale_raw) - id(water_tare_offset)) / id(water_full_scale_weight);
+          ESP_LOGI("water_scale", "Nouveau poids de référence: %f, nouveau facteur: %f", 
+                  id(water_full_scale_weight), id(water_scale_factor));
+
+# ========================= VÉRIFICATIONS PÉRIODIQUES =========================
+interval:
+  # Vérification de la balance d'eau
+  - interval: 12h
+    then:
+      - logger.log: "Vérification périodique de la balance d'eau"
+      - if:
+          condition:
+            lambda: 'return id(water_scale_value).state > 1.9 || id(water_scale_value).state < -0.05;'
+          then:
+            - lambda: |-
+                if (id(water_scale_value).state < 0.05) {
+                  id(water_tare_offset) = id(water_scale_raw).state;
+                  ESP_LOGI("water_scale", "Recalibration auto: %f", id(water_tare_offset));
+                }
