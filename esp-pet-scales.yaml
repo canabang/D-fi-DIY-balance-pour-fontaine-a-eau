@@ -1,0 +1,17 @@
+substitutions:
+  name: "esp-pet-scales"
+  idname: "esp_pet_scales" # "_" est le seul caractère autoriser
+  board: esp32dev
+  type: esp-idf # ou arduino
+  loglevel: DEBUG #VERY_VERBOSE DEBUG
+  static_ip: 192.168.xxx.xxx
+
+  
+packages:
+  base: !include .base.yaml
+  hx711: !include .balance_eau.yaml
+  
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "votre_api_key"
